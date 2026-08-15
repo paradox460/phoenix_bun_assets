@@ -1,0 +1,10 @@
+<%= if @tailwind do %>@import "tailwindcss";
+<% end %>@import "phoenix-colocated/<%= @app %>/colocated.css";
+
+/* This file is for your main application CSS */
+
+/* Make LiveView wrapper divs transparent for layout */
+[data-phx-session],
+[data-phx-teleported-src] {
+  display: contents;
+}

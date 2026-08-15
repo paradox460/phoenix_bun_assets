@@ -1,0 +1,125 @@
+import { watch, existsSync } from "node:fs";
+import { relative, resolve } from "node:path";
+<%= if @tailwind do %>import tailwind from "bun-plugin-tailwind";
+<% end %>
+// Bun computes inline-sourcemap `sources` paths relative to `outdir`; dropping
+// `outdir` makes that prefix nondeterministic across builds (byte-identical code,
+// differing sourcemap) which would defeat change detection. Build into a fixed,
+// unwatched staging dir to keep output deterministic, then copy only the bytes
+// that actually changed into the live-reloaded `priv/static/assets`.
+const stageDir = ".build-stage";
+const outDir = "../priv/static/assets";
+
+const base = {
+  entrypoints: ["<%= @js_entry %>", "<%= @css_entry %>"],
+  outdir: stageDir,
+  root: ".",
+  external: ["/fonts/*", "/images/*"],
+<%= if @tailwind do %>  plugins: [tailwind],
+<% end %>  throw: false,
+};
+
+async function build(opts: Record<string, unknown>) {
+  const result = await Bun.build({ ...base, ...opts });
+
+  if (!result.success) {
+    console.error(`[assets] build failed (${result.logs.length} error${result.logs.length === 1 ? "" : "s"})`);
+    for (const log of result.logs) {
+      console.error(log);
+    }
+    return result;
+  }
+
+  const stageAbs = resolve(stageDir);
+  const written: string[] = [];
+  for (const output of result.outputs) {
+    const rel = relative(stageAbs, output.path);
+    const dest = `${outDir}/${rel}`;
+    const bytes = Buffer.from(await output.arrayBuffer());
+    const existing = Bun.file(dest);
+    if ((await existing.exists()) && Buffer.from(await existing.arrayBuffer()).equals(bytes)) {
+      continue;
+    }
+    await Bun.write(dest, bytes);
+    written.push(rel.split("/").pop()!);
+  }
+  console.log(written.length > 0 ? `[assets] rebuilt ${written.join(", ")}` : "[assets] no changes");
+  return result;
+}
+
+const dev = {
+  sourcemap: "inline",
+  define: { "process.env.NODE_ENV": '"development"' },
+};
+
+const prod = {
+  minify: true,
+  define: { "process.env.NODE_ENV": '"production"' },
+};
+
+const mode = process.argv[2];
+
+if (mode === "deploy") {
+  const result = await build(prod);
+  if (!result.success) process.exit(1);
+} else if (mode === "watch") {
+  // The Phoenix watcher spawns this process via an Erlang port (System.cmd/3).
+  // A graceful BEAM shutdown closes the port, which closes our stdin; a violent
+  // one (SIGKILL, crash) would otherwise leave this process reparented to PID 1
+  // as an orphan that keeps rewriting bundles. Two layers guard against that:
+  //  1. Reap any orphaned predecessor recorded in the pidfile on boot.
+  //  2. Exit when stdin reaches EOF (the port closed => our parent is gone).
+  const pidFile = `${stageDir}/watcher.pid`;
+
+  const isStaleWatcher = (pid: number): boolean => {
+    if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return false;
+    // Confirm the recorded pid is still one of our watchers before killing it,
+    // so a recycled pid belonging to an unrelated process is never touched.
+    const ps = Bun.spawnSync(["ps", "-o", "command=", "-p", String(pid)]);
+    return ps.success && ps.stdout.toString().includes("build.ts");
+  };
+
+  if (existsSync(pidFile)) {
+    const prev = Number.parseInt(await Bun.file(pidFile).text(), 10);
+    if (isStaleWatcher(prev)) {
+      try {
+        process.kill(prev, "SIGTERM");
+        console.log(`[assets] reaped orphaned watcher ${prev}`);
+      } catch {
+        // Already gone between the check and the signal; nothing to do.
+      }
+    }
+  }
+  await Bun.write(pidFile, String(process.pid));
+
+  const runBuild = () => build(dev);
+  await runBuild();
+
+  let timer: Timer;
+  const trigger = () => {
+    clearTimeout(timer);
+    timer = setTimeout(runBuild, 60);
+  };
+
+  const dirs = ["../_build/dev/phoenix-colocated/<%= @app %>", "js", "css", "vendor"];
+  for (const dir of dirs) {
+    if (existsSync(dir)) watch(dir, { recursive: true }, trigger);
+  }
+
+  console.log("[assets] watching");
+
+  // Drain stdin; EOF resolves the read loop and means the port (and BEAM) closed.
+  const reader = Bun.stdin.stream().getReader();
+  try {
+    while (!(await reader.read()).done) {
+      // Discard input; we only care about the EOF signal.
+    }
+  } catch {
+    // stdin error: treat as parent gone.
+  }
+  console.log("[assets] stdin closed, exiting");
+  process.exit(0);
+} else {
+  const result = await build(dev);
+  if (!result.success) process.exit(1);
+}
