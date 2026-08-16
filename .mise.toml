@@ -1,0 +1,6 @@
+[tools]
+elixir = "latest"
+erlang = "latest"
+
+[settings]
+lockfile = true
